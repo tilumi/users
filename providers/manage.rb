@@ -56,6 +56,7 @@ action :create do
   else
     puts new_resource.inspect
     puts new_resource.data_bag.inspect
+    puts new_resource.search_group.inspect
     search(new_resource.data_bag, "groups:#{new_resource.search_group} AND NOT action:remove") do |u|
       puts u.inspect
       u['username'] ||= u['id']
