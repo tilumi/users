@@ -51,10 +51,10 @@ end
 action :create do
   users_groups = {}
   users_groups[new_resource.group_name] = []
-
   if search_missing?
     Chef::Log.warn('This recipe uses search. Chef Solo does not support search unless you install the chef-solo-search cookbook.')
   else
+    puts new_resource.inspect
     search(new_resource.data_bag, "groups:#{new_resource.search_group} AND NOT action:remove") do |u|
       u['username'] ||= u['id']
       u['groups'].each do |g|
