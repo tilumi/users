@@ -151,10 +151,17 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for component/sequence/data-flow diagrams
 
 ## Build & test
 
+Maven (Java 8):
+
 ```bash
-sbt package   # produces a jar to add with --jars
-sbt test      # runs MultiDeltaWriterSuite against a local SparkSession
+mvn package    # builds the jar (target/…-0.1.0.jar) to add with --jars
+mvn test       # runs MultiDeltaWriterSuite against a local SparkSession
 ```
+
+Compiles to **Java 8 bytecode** (`-release:8`), which Spark 3.5 / Delta 3.2 support.
+The `--add-opens` flags Spark needs on JDK 9+ are wired into a `jdk9plus` profile
+that auto-activates only on JDK 9+ — on Java 8 nothing extra is passed. An
+equivalent `build.sbt` is included if you prefer sbt.
 
 ## Validation status
 
@@ -167,12 +174,13 @@ routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
 partition-type validation, fail-fast on missing options, and the **single-pass**
 guarantee (4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
 
-> Note: on JDK 17+ the `--add-opens` flags in `build.sbt` are required for Spark
-> to run (they're wired into `Test / javaOptions`). Spark 3.5 targets JDK 8/11/17.
+> Java: Spark 3.5 targets JDK 8/11/17. The code compiles under `-release:8` (links
+> against Java 8 APIs only) and runs on all three; the `--add-opens` flags are only
+> needed, and only applied, on JDK 9+.
 
-Pin `sparkVersion` / `deltaVersion` in `build.sbt` to match your cluster
-**exactly** — this touches Spark internal datasource classes and Delta internal
-transaction APIs, neither of which is source-stable across major versions.
+Pin the `spark.version` / `delta.version` in `pom.xml` (or `build.sbt`) to match
+your cluster **exactly** — this touches Spark internal datasource classes and Delta
+internal transaction APIs, neither of which is source-stable across major versions.
 
 ## Data skipping (per-file stats)
 
