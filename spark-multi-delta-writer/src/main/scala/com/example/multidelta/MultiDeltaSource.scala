@@ -11,7 +11,7 @@ import org.apache.spark.sql.connector.write._
 import org.apache.spark.sql.execution.datasources.OutputWriterFactory
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
 import org.apache.spark.sql.sources.DataSourceRegister
-import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.types._
 import org.apache.spark.util.SerializableConfiguration
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -27,14 +27,17 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
  *     .option("basePath", "/mnt/warehouse")    // table dir = basePath/<routeValue>
  *     .option("sinkFormat", "delta")           // "delta" (default) or "parquet"
  *     .option("dropRouteColumn", "true")       // drop the routing column from output
- *     .mode("append")
+ *     .option("partitionBy", "dt,country")     // Hive-style partition columns per table
+ *     .option("maxRecordsPerFile", "1000000")  // 0 = unbounded; else roll files
+ *     .mode("append")                          // or "overwrite" (per touched table)
  *     .save()
  * }}}
  *
  * Semantics: NOT atomic across tables (accepted trade-off). Each Delta table is
  * committed independently on the driver; a failure after some tables committed
  * leaves partial state. Make each write idempotent upstream if you need
- * convergence on retry.
+ * convergence on retry. `overwrite` replaces only the tables that receive rows
+ * in this write; tables not touched are left untouched.
  */
 class MultiDeltaSource extends TableProvider with DataSourceRegister {
 
@@ -59,25 +62,32 @@ class MultiDeltaTable(tableSchema: StructType) extends Table with SupportsWrite 
   override def schema(): StructType = tableSchema
 
   override def capabilities(): util.Set[TableCapability] =
-    util.EnumSet.of(TableCapability.BATCH_WRITE, TableCapability.ACCEPT_ANY_SCHEMA)
+    // TRUNCATE enables mode("overwrite") (OverwriteByExpression with a `true` filter).
+    util.EnumSet.of(
+      TableCapability.BATCH_WRITE,
+      TableCapability.TRUNCATE,
+      TableCapability.ACCEPT_ANY_SCHEMA)
 
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
     new MultiDeltaWriteBuilder(info)
 }
 
-class MultiDeltaWriteBuilder(info: LogicalWriteInfo) extends WriteBuilder {
-  override def build(): Write = new MultiDeltaWrite(info)
+/** SupportsTruncate is what routes mode("overwrite") to us. */
+class MultiDeltaWriteBuilder(info: LogicalWriteInfo) extends WriteBuilder with SupportsTruncate {
+  private var overwrite = false
+  override def truncate(): WriteBuilder = { overwrite = true; this }
+  override def build(): Write = new MultiDeltaWrite(info, overwrite)
 }
 
-class MultiDeltaWrite(info: LogicalWriteInfo) extends Write {
-  override def toBatch: BatchWrite = new MultiDeltaBatchWrite(info)
+class MultiDeltaWrite(info: LogicalWriteInfo, overwrite: Boolean) extends Write {
+  override def toBatch: BatchWrite = new MultiDeltaBatchWrite(info, overwrite)
 }
 
 /**
  * Driver-side coordinator. Builds the (serializable) Parquet OutputWriterFactory
  * once, ships it to executors, and on commit finalizes each table.
  */
-class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
+class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends BatchWrite {
 
   private val opts        = info.options()
   private val fullSchema  = info.schema()
@@ -85,29 +95,49 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
   private val basePath    = required("basePath").stripSuffix("/")
   private val sinkFormat  = Option(opts.get("sinkFormat")).getOrElse("delta").toLowerCase
   private val dropRoute   = opts.getBoolean("dropRouteColumn", true)
-  // 0 (default) = unbounded: all rows for a table within a task go to one file.
-  // >0 = roll to a new file (and a new AddFile) after this many records.
   private val maxRecordsPerFile = opts.getLong("maxRecordsPerFile", 0L)
+  private val partitionCols: Seq[String] =
+    Option(opts.get("partitionBy"))
+      .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Nil)
 
   private val routeIdx = fullSchema.fieldIndex(routeColumn)
 
-  /** Schema actually written to each target table (route column optionally removed). */
-  private val writeSchema: StructType =
-    if (dropRoute) StructType(fullSchema.fields.zipWithIndex.collect {
-      case (f, i) if i != routeIdx => f
-    })
+  // Validate partition columns up-front (fail on the driver, not mid-job).
+  partitionCols.foreach { c =>
+    val i = fullSchema.fieldNames.indexOf(c)
+    if (i < 0) throw new IllegalArgumentException(s"partitionBy column '$c' not found in schema")
+    if (i == routeIdx)
+      throw new IllegalArgumentException(s"partitionBy column '$c' cannot be the routeColumn")
+    fullSchema(i).dataType match {
+      case StringType | BooleanType | ByteType | ShortType | IntegerType | LongType => // ok
+      case dt => throw new IllegalArgumentException(
+        s"partitionBy column '$c' has unsupported type $dt (use string/boolean/integral; " +
+          "date/timestamp partitions need custom value formatting)")
+    }
+  }
+
+  // tableSchema = what Delta records as the table schema (route col optionally removed,
+  //               partition columns INCLUDED — Delta keeps them in the schema).
+  private val tableSchema: StructType =
+    if (dropRoute) StructType(fullSchema.fields.zipWithIndex.collect { case (f, i) if i != routeIdx => f })
     else fullSchema
+
+  private val partitionSet = partitionCols.toSet
+  // dataSchema = what the Parquet files actually contain (partition columns live in the
+  //              directory path, not the file — standard Hive/Delta layout).
+  private val dataSchema: StructType =
+    StructType(tableSchema.fields.filterNot(f => partitionSet.contains(f.name)))
+
+  private val partitionIdxInFull: Array[Int] = partitionCols.map(fullSchema.fieldIndex).toArray
 
   @transient private val spark = SparkSession.active
   @transient private val hadoopConf = spark.sessionState.newHadoopConf()
 
-  // prepareWrite must run on the driver; it MUTATES the job's Configuration with
-  // the Parquet write-support class + schema, so the executors must receive THAT
-  // configuration (not the bare session conf) or they hit
-  // "writeSupportClass cannot be null".
+  // prepareWrite MUTATES the job's Configuration with the Parquet write-support class +
+  // schema; executors must receive THAT configuration (built from dataSchema).
   private val job = Job.getInstance(hadoopConf)
   private val parquetFactory: OutputWriterFactory =
-    new ParquetFileFormat().prepareWrite(spark, job, Map.empty[String, String], writeSchema)
+    new ParquetFileFormat().prepareWrite(spark, job, Map.empty[String, String], dataSchema)
   private val serConf = new SerializableConfiguration(job.getConfiguration)
 
   private def required(key: String): String =
@@ -115,12 +145,12 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
 
   override def createBatchWriterFactory(pInfo: PhysicalWriteInfo): DataWriterFactory =
     new MultiDeltaWriterFactory(
-      fullSchema, writeSchema, routeIdx, dropRoute, basePath, parquetFactory, serConf, maxRecordsPerFile)
+      fullSchema, dataSchema, routeIdx, dropRoute, partitionCols.toArray, partitionIdxInFull,
+      basePath, parquetFactory, serConf, maxRecordsPerFile)
 
   override def useCommitCoordinator(): Boolean = false
 
   override def commit(messages: Array[WriterCommitMessage]): Unit = {
-    // table -> all files written for it across every task
     val addsByTable: Map[String, Seq[WrittenFile]] =
       messages.collect { case m: MultiDeltaCommitMessage => m.files }
         .flatten
@@ -129,22 +159,18 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
 
     sinkFormat match {
       case "delta" =>
-        DeltaCommitter.commitAll(spark, basePath, writeSchema, addsByTable)
+        DeltaCommitter.commitAll(spark, basePath, tableSchema, partitionCols, addsByTable, overwrite)
       case "parquet" =>
-        // Files were written straight into basePath/<table>; they ARE the table.
-        // Nothing to commit — just drop a _SUCCESS marker per touched table.
-        ParquetCommitter.finalizeAll(serConf, basePath, addsByTable.keys.toSeq)
+        ParquetCommitter.finalizeAll(serConf, basePath, addsByTable, overwrite)
       case other =>
         throw new IllegalArgumentException(s"Unsupported sinkFormat '$other' (use 'delta' or 'parquet')")
     }
   }
 
   override def abort(messages: Array[WriterCommitMessage]): Unit = {
-    // Best-effort cleanup of orphaned files. For the delta sink these were never
-    // committed to the log, so deleting the parquet files is sufficient.
     messages.collect { case m: MultiDeltaCommitMessage => m.files }.flatten.foreach { wf =>
       try {
-        val p = new org.apache.hadoop.fs.Path(s"$basePath/${wf.table}/${wf.name}")
+        val p = new org.apache.hadoop.fs.Path(s"$basePath/${wf.table}/${wf.relPath}")
         p.getFileSystem(serConf.value).delete(p, false)
       } catch { case _: Throwable => /* best effort */ }
     }

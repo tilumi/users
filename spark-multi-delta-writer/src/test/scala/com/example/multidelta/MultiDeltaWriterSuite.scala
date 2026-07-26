@@ -151,6 +151,88 @@ class MultiDeltaWriterSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(spark.read.format("delta").load(s"$base/us").count() === 25)
   }
 
+  private def fullMessage(t: Throwable): String = {
+    val sb = new StringBuilder; var c: Throwable = t
+    while (c != null) { sb.append(String.valueOf(c.getMessage)).append(" | "); c = c.getCause }
+    sb.toString.toLowerCase
+  }
+
+  test("partitioned delta sink: hive-style dirs + reconstructed partition columns") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    val df = Seq(("us", "2021", "alice"), ("us", "2022", "bob"), ("eu", "2021", "carol"))
+      .toDF("region", "dt", "name")
+
+    df.write.format("multiDelta")
+      .option("routeColumn", "region").option("basePath", base)
+      .option("partitionBy", "dt").mode("append").save()
+
+    val fs = new Path(base).getFileSystem(spark.sessionState.newHadoopConf())
+    assert(fs.exists(new Path(s"$base/us/dt=2021")))
+    assert(fs.exists(new Path(s"$base/us/dt=2022")))
+
+    val us = spark.read.format("delta").load(s"$base/us")
+    assert(us.columns.toSet === Set("dt", "name")) // route dropped, dt reconstructed from path
+    assert(us.count() === 2)
+    // partition pruning returns the right row
+    assert(us.where($"dt" === "2021").select("name").as[String].collect().toSeq === Seq("alice"))
+  }
+
+  test("partitioned parquet sink: partition discovery on read-back") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    Seq(("us", "2021", "a"), ("us", "2022", "b")).toDF("region", "dt", "name")
+      .write.format("multiDelta").option("routeColumn", "region").option("basePath", base)
+      .option("sinkFormat", "parquet").option("partitionBy", "dt").mode("append").save()
+
+    val us = spark.read.parquet(s"$base/us")
+    assert(us.columns.toSet === Set("dt", "name"))
+    assert(us.count() === 2)
+  }
+
+  test("overwrite mode replaces only the tables that receive rows (delta)") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    sampleDf().write.format("multiDelta").option("routeColumn", "region")
+      .option("basePath", base).mode("append").save() // us=3, eu=2, apac=1
+
+    Seq((10, "us", "zoe"), (11, "us", "yan")).toDF("id", "region", "name")
+      .write.format("multiDelta").option("routeColumn", "region")
+      .option("basePath", base).mode("overwrite").save() // overwrite only us
+
+    val us = spark.read.format("delta").load(s"$base/us")
+    assert(us.count() === 2, "us replaced 3 -> 2")
+    assert(us.select("name").as[String].collect().toSet === Set("zoe", "yan"))
+    assert(spark.read.format("delta").load(s"$base/eu").count() === 2, "eu untouched")
+    assert(spark.read.format("delta").load(s"$base/apac").count() === 1, "apac untouched")
+  }
+
+  test("overwrite mode removes stale files (parquet)") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    sampleDf().write.format("multiDelta").option("routeColumn", "region")
+      .option("basePath", base).option("sinkFormat", "parquet").mode("append").save()
+
+    Seq((10, "us", "zoe")).toDF("id", "region", "name")
+      .write.format("multiDelta").option("routeColumn", "region")
+      .option("basePath", base).option("sinkFormat", "parquet").mode("overwrite").save()
+
+    val us = spark.read.parquet(s"$base/us")
+    assert(us.count() === 1)
+    assert(us.select("name").as[String].collect().toSeq === Seq("zoe"))
+  }
+
+  test("unsupported partition column type fails fast") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    val df = Seq((1.5, "us")).toDF("amount", "region") // double partition -> rejected
+    val e = intercept[Exception] {
+      df.write.format("multiDelta").option("routeColumn", "region")
+        .option("basePath", base).option("partitionBy", "amount").mode("append").save()
+    }
+    assert(fullMessage(e).contains("partitionby") && fullMessage(e).contains("unsupported"))
+  }
+
   test("missing required options fail fast") {
     val base = tmpDir()
     val e = intercept[Exception] {

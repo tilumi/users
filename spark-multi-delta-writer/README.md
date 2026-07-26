@@ -24,14 +24,31 @@ df.write.format("multiDelta")
   .option("basePath", "/mnt/warehouse")   // required: table dir = basePath/<routeValue>
   .option("sinkFormat", "delta")          // "delta" (default) or "parquet"
   .option("dropRouteColumn", "true")      // default true: strip routing column from output
+  .option("partitionBy", "dt,country")    // Hive-style partition columns applied to every table
   .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
-  .mode("append")
+  .mode("append")                         // or "overwrite" (replaces only touched tables)
   .save()
 ```
 
 - `sinkFormat=delta` → commits `AddFile` actions to each table's `_delta_log`.
 - `sinkFormat=parquet` → writes parquet straight into `basePath/<table>` and drops
   a `_SUCCESS` marker; the files *are* the table (no transaction log).
+
+### Partitioning
+
+`partitionBy` writes standard Hive-style `col=value/` subdirectories under each
+table and records the values in `AddFile.partitionValues` (delta) — so reads
+prune partitions normally, and the parquet sink is discovered by Spark's usual
+partition inference. Partition columns live in the path, not the data files.
+Supported partition types: string / boolean / integral (date & timestamp need
+custom value formatting and are rejected up-front).
+
+### Overwrite mode
+
+`mode("overwrite")` replaces the contents of **only the tables that receive rows
+in this write** — untouched tables are left alone. Delta does it transactionally
+(`RemoveFile` for the current files + the new `AddFile`s in one commit); the
+parquet sink deletes pre-existing files not written by this commit.
 
 ## Output layout & file sizing
 
@@ -65,8 +82,8 @@ For the delta sink you can also compact after the fact with `OPTIMIZE <table>`.
 |-------|-------|------|
 | `MultiDeltaSource` / `Table` / `WriteBuilder` | driver | DSv2 plumbing; pulls the query schema |
 | `MultiDeltaBatchWrite` | driver | builds the serializable Parquet `OutputWriterFactory`, coordinates commit |
-| `MultiDeltaDataWriter` | executor | **one open Parquet writer per target table**, routes each row (single pass) |
-| `DeltaCommitter` / `ParquetCommitter` | driver | finalizes each table (log commit vs `_SUCCESS`) |
+| `MultiDeltaDataWriter` | executor | **one open Parquet writer per (table, partition dir)**, routes each row (single pass), rolls files at `maxRecordsPerFile` |
+| `DeltaCommitter` / `ParquetCommitter` | driver | finalizes each table (append/overwrite; log commit vs `_SUCCESS`) |
 
 ## Build & test
 
@@ -78,10 +95,12 @@ sbt test      # runs MultiDeltaWriterSuite against a local SparkSession
 ## Validation status
 
 Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
-(Scala 2.12.18). All six cases in `MultiDeltaWriterSuite` pass — delta routing,
-append accumulation, `dropRouteColumn`, the pure-parquet sink (`_SUCCESS`, no
-`_delta_log`), fail-fast on missing options, and the **single-pass** guarantee
-(4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
+(Scala 2.12.18). All 12 cases in `MultiDeltaWriterSuite` pass — delta & parquet
+routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
+**partitioned** tables (delta + parquet), **overwrite** mode (selective replace
++ stale-file removal), partition-type validation, fail-fast on missing options,
+and the **single-pass** guarantee (4 input rows across 3 target tables trigger
+exactly 4 row-visits, not 12).
 
 > Note: on JDK 17+ the `--add-opens` flags in `build.sbt` are required for Spark
 > to run (they're wired into `Test / javaOptions`). Spark 3.5 targets JDK 8/11/17.
@@ -92,12 +111,14 @@ transaction APIs, neither of which is source-stable across major versions.
 
 ## Known limitations (extension points)
 
-- **Append only.** `overwrite` needs `RemoveFile` actions (delta) or dir
-  clearing (parquet) before the commit.
-- **Unpartitioned target tables.** Partitioned output requires routing rows to
-  `col=val/` subdirs and populating `AddFile.partitionValues`.
 - **No per-file Delta stats.** `AddFile.stats` is left null (data skipping still
   works via file pruning, just less selectively). Populate it for better skipping.
 - **Sequential commits.** Tables commit one-by-one on the driver; wrap
   `DeltaCommitter` in a `Future` pool if commit latency matters.
 - **String routing column** assumed; extend `routeValue` for other types.
+- **Partition types limited** to string / boolean / integral. Date & timestamp
+  need value formatting that matches Delta's expectations (extend
+  `rawPartitionValue`).
+- **Overwrite is per-table, not per-partition.** `mode("overwrite")` replaces a
+  touched table entirely; dynamic partition overwrite (replace only the written
+  partitions) would need `RemoveFile`s scoped to the affected partitions.
