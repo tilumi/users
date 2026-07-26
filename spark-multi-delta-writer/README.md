@@ -68,6 +68,9 @@ input partition that carries its rows**. Rows scattered across `P` partitions �
 
 - `df.repartition(col("routeColumn"))` before writing → collapses each table to
   ~1 file per partition (measured: 300k rows, 4 partitions → 12 files dropped to 3).
+  **Only safe when the routing key is not skewed** — hash-partitioning a skewed
+  key funnels the hot value into one task/file (straggler + OOM risk). Prefer the
+  `REBALANCE` hint below, which splits hot keys; see *Handling skew*.
 - `maxRecordsPerFile` → caps how many rows land in each file, rolling to a new
   file (and a new `AddFile`) past the limit. Measured on 300k single-partition
   rows: unbounded = 1 file (3.9 MiB); `maxRecordsPerFile=50000` = 6 even files
@@ -75,6 +78,30 @@ input partition that carries its rows**. Rows scattered across `P` partitions �
   guarantee no single giant file regardless of input partitioning.
 
 For the delta sink you can also compact after the fact with `OPTIMIZE <table>`.
+
+### Handling skew in the routing column
+
+Routing skew only hurts if you pre-shuffle by the routing key:
+
+- **Default write (no repartition):** unaffected. Tasks are sized by *input*
+  partitions, so a hot routing value just yields larger files, not a straggler.
+- **`repartition($"routeColumn")`:** dangerous under skew — all hot-value rows
+  hash to one partition, so one task writes the whole hot table (straggler; the
+  task also holds that table's full Parquet row-group buffer → OOM risk).
+- **`REBALANCE(<routeCol>)` + AQE (recommended):** AQE's
+  `optimizeSkewsInRebalancePartitions` (default on) *splits* the hot key into
+  several even, target-sized partitions written by different tasks in parallel.
+  Measured through this sink at 98% skew: `repartition` produced one 8.3 MiB hot
+  file from a single task; `REBALANCE` produced 8 even ~1 MiB files and finished
+  ~2.4× faster. Set `spark.sql.adaptive.advisoryPartitionSizeInBytes` to your
+  target file size.
+
+Two related cautions: don't set `maxRecordsPerFile` so low that a huge hot table
+emits an enormous number of `AddFile`s (bloats `_delta_log`); and note the memory
+ceiling is driven by *routing cardinality*, not skew — each task holds one open
+Parquet writer per `(table, partition)` it currently sees, so hundreds of distinct
+routing values per task means hundreds of row-group buffers. Cluster/sort by the
+routing column (e.g. via `REBALANCE`) so each task touches few tables at once.
 
 ### Interop with Synapse / Databricks "Optimized Write"
 
