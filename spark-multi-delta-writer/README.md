@@ -76,6 +76,26 @@ input partition that carries its rows**. Rows scattered across `P` partitions �
 
 For the delta sink you can also compact after the fact with `OPTIMIZE <table>`.
 
+### Interop with Synapse / Databricks "Optimized Write"
+
+Optimized Write (`spark.microsoft.delta.optimizeWrite.enabled`,
+`delta.autoOptimize.optimizeWrite`) is implemented **inside Delta's write path** —
+an adaptive shuffle injected into `TransactionalWrite.writeFiles`. This sink
+supplies its **own** write path and uses only Delta's **commit** path
+(`txn.commit`), so the `optimizeWrite` flag/table-property has **no effect here**.
+To get the same even, target-sized files in a single pass:
+
+- **`REBALANCE` hint + AQE** — `SELECT /*+ REBALANCE(<routeCol>[, <partCols>]) */`
+  before the write, with `spark.sql.adaptive.advisoryPartitionSizeInBytes` set to
+  your target file size (e.g. `128m`). AQE coalesces small tables to one file and
+  splits large ones into even chunks. Measured through this sink (skewed 400k
+  rows): the small tables dropped from 8 tiny files to 1 target-sized file each,
+  while the large table stayed evenly split — Optimized-Write-equivalent layout.
+- **`maxRecordsPerFile`** as a hard per-file cap (see above).
+- **Auto Compact** (`delta.autoOptimize.autoCompact`) is a *post-commit hook*, and
+  this sink does call `txn.commit`, so — unlike Optimized Write — it may still fire
+  for the delta sink. Enable and verify on your Synapse runtime.
+
 ## How it works
 
 | Stage | Where | What |
