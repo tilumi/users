@@ -187,6 +187,21 @@ boolean, nested) get no min/max — safe by construction: every emitted bound is
 true lower/upper bound, so skipping can never drop a valid row. `nullCount` is
 tracked for all indexed columns. Set `collectStats=false` to skip the work.
 
+**Effectiveness needs clustering.** `min`/`max` only enable skipping when each file
+covers a narrow, non-overlapping range of the *filtered* column — i.e. the data is
+sorted or `ZORDER`ed on that column. Randomly-ordered data still gets correct stats
+but little skipping (`nullCount`/`numRecords` help regardless). Note
+`sortWithinPartitions` clusters the routing/partition columns, **not** your data
+columns — to skip on `id`, sort by `id` before writing or run
+`OPTIMIZE <table> ZORDER BY (id)` afterward.
+
+**Cost** is `O(rows × indexed columns)`, collected in the same pass. Primitive
+columns are near-free (one comparison/row); string columns cost more (a byte-compare
+per row plus a copy whenever a new min/max appears — worst on ascending-sorted
+strings). On a deliberately cheap local write (2M rows, local SSD) stats added
+~15–18% of write time; on real object-store writes where Parquet encoding + IO
+dominate it is a low-single-digit fraction, which is why it defaults on.
+
 ## Known limitations (extension points)
 
 - **Sequential commits.** Tables commit one-by-one on the driver; wrap
