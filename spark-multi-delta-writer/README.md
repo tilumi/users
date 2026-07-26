@@ -1,0 +1,64 @@
+# spark-multi-delta-writer
+
+A DataSource V2 sink that fans **one DataFrame out to many tables in a single
+Spark job / single pass over the data**, routing each row to a target table by a
+routing column. Supports **Delta** and **pure Parquet** sinks.
+
+## Why this exists
+
+Calling `df.write` once per table is slow because each call is a separate Spark
+action: the upstream DAG is recomputed, jobs run sequentially, and (even cached)
+the data is re-scanned once per table. This sink scans/computes the source
+**once** and writes every table's files from the same task set.
+
+Trade-off, accepted by design: writes are **not atomic across tables**. Each
+Delta table is committed with its own transaction; a mid-commit failure leaves
+partial state. Make upstream writes idempotent (e.g. `MERGE` on a key, or Delta
+`txnAppId`/`txnVersion`) if you need convergence on retry.
+
+## Usage
+
+```scala
+df.write.format("multiDelta")
+  .option("routeColumn", "target_table")  // required: value of this column picks the table
+  .option("basePath", "/mnt/warehouse")   // required: table dir = basePath/<routeValue>
+  .option("sinkFormat", "delta")          // "delta" (default) or "parquet"
+  .option("dropRouteColumn", "true")      // default true: strip routing column from output
+  .mode("append")
+  .save()
+```
+
+- `sinkFormat=delta` → commits `AddFile` actions to each table's `_delta_log`.
+- `sinkFormat=parquet` → writes parquet straight into `basePath/<table>` and drops
+  a `_SUCCESS` marker; the files *are* the table (no transaction log).
+
+## How it works
+
+| Stage | Where | What |
+|-------|-------|------|
+| `MultiDeltaSource` / `Table` / `WriteBuilder` | driver | DSv2 plumbing; pulls the query schema |
+| `MultiDeltaBatchWrite` | driver | builds the serializable Parquet `OutputWriterFactory`, coordinates commit |
+| `MultiDeltaDataWriter` | executor | **one open Parquet writer per target table**, routes each row (single pass) |
+| `DeltaCommitter` / `ParquetCommitter` | driver | finalizes each table (log commit vs `_SUCCESS`) |
+
+## Build
+
+```bash
+sbt package   # produces a jar to add with --jars
+```
+
+Pin `sparkVersion` / `deltaVersion` in `build.sbt` to match your cluster
+**exactly** — this touches Spark internal datasource classes and Delta internal
+transaction APIs, neither of which is source-stable across major versions.
+
+## Known limitations (extension points)
+
+- **Append only.** `overwrite` needs `RemoveFile` actions (delta) or dir
+  clearing (parquet) before the commit.
+- **Unpartitioned target tables.** Partitioned output requires routing rows to
+  `col=val/` subdirs and populating `AddFile.partitionValues`.
+- **No per-file Delta stats.** `AddFile.stats` is left null (data skipping still
+  works via file pruning, just less selectively). Populate it for better skipping.
+- **Sequential commits.** Tables commit one-by-one on the driver; wrap
+  `DeltaCommitter` in a `Future` pool if commit latency matters.
+- **String routing column** assumed; extend `routeValue` for other types.
