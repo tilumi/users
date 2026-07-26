@@ -46,12 +46,14 @@ class MultiDeltaWriterFactory(
     basePath: String,
     parquetFactory: OutputWriterFactory,
     serConf: SerializableConfiguration,
-    maxRecordsPerFile: Long) extends DataWriterFactory {
+    maxRecordsPerFile: Long,
+    sortedMode: Boolean) extends DataWriterFactory {
 
   override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] =
     new MultiDeltaDataWriter(
       partitionId, taskId, fullSchema, dataSchema, routeIdx, dropRoute,
-      partitionColNames, partitionIdxInFull, basePath, parquetFactory, serConf, maxRecordsPerFile)
+      partitionColNames, partitionIdxInFull, basePath, parquetFactory, serConf,
+      maxRecordsPerFile, sortedMode)
 }
 
 /**
@@ -72,7 +74,8 @@ class MultiDeltaDataWriter(
     basePath: String,
     parquetFactory: OutputWriterFactory,
     serConf: SerializableConfiguration,
-    maxRecordsPerFile: Long) extends DataWriter[InternalRow] {
+    maxRecordsPerFile: Long,
+    sortedMode: Boolean) extends DataWriter[InternalRow] {
 
   private val hadoopConf = serConf.value
   private val routeType  = fullSchema(routeIdx).dataType
@@ -160,6 +163,13 @@ class MultiDeltaDataWriter(
     val table = routeValue(record)
     val (subPath, partValues) = computePartition(record)
     val key = (table, subPath)
+    // Sorted input: a new key means the previous group is finished, so flush the
+    // open writer(s). `open` then holds at most one entry -> memory is bounded to a
+    // single Parquet row-group buffer regardless of how many tables/partitions exist.
+    if (sortedMode && !open.contains(key) && open.nonEmpty) {
+      open.foreach { case ((t, _), o) => closeFile(o, t) }
+      open.clear()
+    }
     val of = open.getOrElseUpdate(key, openNew(table, subPath, partValues))
     of.writer.write(project(record))
     of.count += 1

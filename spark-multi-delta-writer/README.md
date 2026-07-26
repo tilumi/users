@@ -26,6 +26,7 @@ df.write.format("multiDelta")
   .option("dropRouteColumn", "true")      // default true: strip routing column from output
   .option("partitionBy", "dt,country")    // Hive-style partition columns applied to every table
   .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
+  .option("sortWithinPartitions", "true") // local-sort by route+partition cols; 1 open writer at a time
   .mode("append")                         // or "overwrite" (replaces only touched tables)
   .save()
 ```
@@ -100,8 +101,21 @@ Two related cautions: don't set `maxRecordsPerFile` so low that a huge hot table
 emits an enormous number of `AddFile`s (bloats `_delta_log`); and note the memory
 ceiling is driven by *routing cardinality*, not skew — each task holds one open
 Parquet writer per `(table, partition)` it currently sees, so hundreds of distinct
-routing values per task means hundreds of row-group buffers. Cluster/sort by the
-routing column (e.g. via `REBALANCE`) so each task touches few tables at once.
+routing values per task means hundreds of row-group buffers.
+
+### `sortWithinPartitions` — bound writer memory for high cardinality
+
+Set `sortWithinPartitions=true` and the sink asks Spark (via DSv2
+`RequiresDistributionAndOrdering`) for a **local** sort by `[routeColumn,
+partitionCols]` before the write — no shuffle, so it does not reintroduce skew.
+Every `(table, partition)` group then arrives contiguously, and the writer keeps
+just **one** open Parquet writer at a time (closing each group as the key changes).
+Memory is bounded to a single row-group buffer regardless of routing cardinality,
+so it stays safe even without the `REBALANCE` hint. Cost: a local sort (CPU, and
+possible spill). Prefer it when a single task may see many distinct routing values;
+skip it when `REBALANCE`/repartition already clusters the data. Verified through
+the sink: interleaved 5-table input stays grouped (not fragmented) with all rows
+preserved across the group boundaries.
 
 ### Interop with Synapse / Databricks "Optimized Write"
 
@@ -142,12 +156,12 @@ sbt test      # runs MultiDeltaWriterSuite against a local SparkSession
 ## Validation status
 
 Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
-(Scala 2.12.18). All 12 cases in `MultiDeltaWriterSuite` pass — delta & parquet
+(Scala 2.12.18). All 13 cases in `MultiDeltaWriterSuite` pass — delta & parquet
 routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
 **partitioned** tables (delta + parquet), **overwrite** mode (selective replace
-+ stale-file removal), partition-type validation, fail-fast on missing options,
-and the **single-pass** guarantee (4 input rows across 3 target tables trigger
-exactly 4 row-visits, not 12).
++ stale-file removal), `sortWithinPartitions` (bounded writers, data preserved),
+partition-type validation, fail-fast on missing options, and the **single-pass**
+guarantee (4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
 
 > Note: on JDK 17+ the `--add-opens` flags in `build.sbt` are required for Spark
 > to run (they're wired into `Test / javaOptions`). Spark 3.5 targets JDK 8/11/17.

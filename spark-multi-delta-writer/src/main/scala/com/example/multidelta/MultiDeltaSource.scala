@@ -6,7 +6,8 @@ import org.apache.hadoop.mapreduce.Job
 
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table, TableCapability, TableProvider}
-import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
+import org.apache.spark.sql.connector.expressions.{Expressions, NullOrdering, SortDirection, SortOrder, Transform}
 import org.apache.spark.sql.connector.write._
 import org.apache.spark.sql.execution.datasources.OutputWriterFactory
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
@@ -79,8 +80,33 @@ class MultiDeltaWriteBuilder(info: LogicalWriteInfo) extends WriteBuilder with S
   override def build(): Write = new MultiDeltaWrite(info, overwrite)
 }
 
-class MultiDeltaWrite(info: LogicalWriteInfo, overwrite: Boolean) extends Write {
+/**
+ * When `sortWithinPartitions` is set, we ask Spark (via RequiresDistributionAndOrdering)
+ * for a LOCAL sort by [routeColumn, partitionCols] before the write — no shuffle, so it
+ * doesn't reintroduce skew. That makes every (table, partition) group contiguous in the
+ * row stream, letting the writer keep just ONE open Parquet writer at a time (bounded
+ * memory regardless of routing cardinality). When unset, all methods are no-ops.
+ */
+class MultiDeltaWrite(info: LogicalWriteInfo, overwrite: Boolean)
+    extends Write with RequiresDistributionAndOrdering {
+
+  private val opts = info.options()
+  private val sortEnabled = opts.getBoolean("sortWithinPartitions", false)
+  private val routeColumn = opts.get("routeColumn")
+  private val partitionCols =
+    Option(opts.get("partitionBy")).map(_.split(",").map(_.trim).filter(_.nonEmpty)).getOrElse(Array.empty[String])
+
   override def toBatch: BatchWrite = new MultiDeltaBatchWrite(info, overwrite)
+
+  override def requiredDistribution(): Distribution = Distributions.unspecified() // no shuffle
+  override def requiredNumPartitions(): Int = 0
+  override def distributionStrictlyRequired(): Boolean = false
+
+  override def requiredOrdering(): Array[SortOrder] =
+    if (!sortEnabled || routeColumn == null) Array.empty
+    else (routeColumn +: partitionCols.toSeq).map { c =>
+      Expressions.sort(Expressions.column(c), SortDirection.ASCENDING, NullOrdering.NULLS_FIRST)
+    }.toArray
 }
 
 /**
@@ -96,6 +122,9 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
   private val sinkFormat  = Option(opts.get("sinkFormat")).getOrElse("delta").toLowerCase
   private val dropRoute   = opts.getBoolean("dropRouteColumn", true)
   private val maxRecordsPerFile = opts.getLong("maxRecordsPerFile", 0L)
+  // When true, input is locally sorted by [routeColumn, partitionCols] (see MultiDeltaWrite),
+  // so the writer holds one open file at a time.
+  private val sortWithinPartitions = opts.getBoolean("sortWithinPartitions", false)
   private val partitionCols: Seq[String] =
     Option(opts.get("partitionBy"))
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Nil)
@@ -146,7 +175,7 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
   override def createBatchWriterFactory(pInfo: PhysicalWriteInfo): DataWriterFactory =
     new MultiDeltaWriterFactory(
       fullSchema, dataSchema, routeIdx, dropRoute, partitionCols.toArray, partitionIdxInFull,
-      basePath, parquetFactory, serConf, maxRecordsPerFile)
+      basePath, parquetFactory, serConf, maxRecordsPerFile, sortWithinPartitions)
 
   override def useCommitCoordinator(): Boolean = false
 

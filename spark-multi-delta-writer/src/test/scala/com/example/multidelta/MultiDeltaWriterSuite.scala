@@ -233,6 +233,46 @@ class MultiDeltaWriterSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(fullMessage(e).contains("partitionby") && fullMessage(e).contains("unsupported"))
   }
 
+  test("sortWithinPartitions=true: local sort + bounded writers, data preserved") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    // 5 tables x 3 partitions, interleaved across 4 input partitions -> exercises the
+    // sorted close-on-key-change path (Spark local-sorts by [region, dt] first).
+    val rows = (0 until 300).map(i => (s"t${i % 5}", s"d${i % 3}", i))
+    val df = rows.toDF("region", "dt", "id").repartition(4)
+
+    df.write.format("multiDelta")
+      .option("routeColumn", "region").option("basePath", base)
+      .option("partitionBy", "dt")
+      .option("sortWithinPartitions", "true")
+      .option("maxRecordsPerFile", "7") // also roll within a group while sorted
+      .mode("append").save()
+
+    var total = 0L
+    (0 until 5).foreach { k =>
+      val t = spark.read.format("delta").load(s"$base/t$k")
+      assert(t.count() === 60, s"t$k should have 60 rows") // 300/5
+      assert(t.columns.toSet === Set("dt", "id"))          // route dropped, dt reconstructed
+      assert(t.select("dt").distinct().count() === 3)
+      total += t.count()
+    }
+    assert(total === 300, "no rows lost across close-on-key-change")
+
+    // Positive proof the local sort engaged: with keys contiguous, close-on-change
+    // rolls only per group (+maxRecordsPerFile). Were the sort a no-op, the
+    // interleaved input would fragment into ~300 one-row files. Bound well below that.
+    val conf = spark.sessionState.newHadoopConf()
+    def countParquet(p: Path): Int = {
+      val fs = p.getFileSystem(conf)
+      if (!fs.exists(p)) 0
+      else fs.listStatus(p).map { s =>
+        if (s.isDirectory) countParquet(s.getPath)
+        else if (s.getPath.getName.endsWith(".parquet")) 1 else 0
+      }.sum
+    }
+    assert(countParquet(new Path(base)) < 120, "local sort should keep files grouped, not fragmented")
+  }
+
   test("missing required options fail fast") {
     val base = tmpDir()
     val e = intercept[Exception] {
