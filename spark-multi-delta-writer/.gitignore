@@ -1,0 +1,6 @@
+target/
+lib/
+*.jar
+project/project/
+project/target/
+.bsp/

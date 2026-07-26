@@ -98,12 +98,14 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
   @transient private val spark = SparkSession.active
   @transient private val hadoopConf = spark.sessionState.newHadoopConf()
 
-  // prepareWrite must run on the driver; the returned factory is serializable.
-  private val parquetFactory: OutputWriterFactory = {
-    val job = Job.getInstance(hadoopConf)
+  // prepareWrite must run on the driver; it MUTATES the job's Configuration with
+  // the Parquet write-support class + schema, so the executors must receive THAT
+  // configuration (not the bare session conf) or they hit
+  // "writeSupportClass cannot be null".
+  private val job = Job.getInstance(hadoopConf)
+  private val parquetFactory: OutputWriterFactory =
     new ParquetFileFormat().prepareWrite(spark, job, Map.empty[String, String], writeSchema)
-  }
-  private val serConf = new SerializableConfiguration(hadoopConf)
+  private val serConf = new SerializableConfiguration(job.getConfiguration)
 
   private def required(key: String): String =
     Option(opts.get(key)).getOrElse(throw new IllegalArgumentException(s"Option '$key' is required"))

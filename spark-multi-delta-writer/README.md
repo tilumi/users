@@ -41,11 +41,23 @@ df.write.format("multiDelta")
 | `MultiDeltaDataWriter` | executor | **one open Parquet writer per target table**, routes each row (single pass) |
 | `DeltaCommitter` / `ParquetCommitter` | driver | finalizes each table (log commit vs `_SUCCESS`) |
 
-## Build
+## Build & test
 
 ```bash
 sbt package   # produces a jar to add with --jars
+sbt test      # runs MultiDeltaWriterSuite against a local SparkSession
 ```
+
+## Validation status
+
+Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
+(Scala 2.12.18). All six cases in `MultiDeltaWriterSuite` pass — delta routing,
+append accumulation, `dropRouteColumn`, the pure-parquet sink (`_SUCCESS`, no
+`_delta_log`), fail-fast on missing options, and the **single-pass** guarantee
+(4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
+
+> Note: on JDK 17+ the `--add-opens` flags in `build.sbt` are required for Spark
+> to run (they're wired into `Test / javaOptions`). Spark 3.5 targets JDK 8/11/17.
 
 Pin `sparkVersion` / `deltaVersion` in `build.sbt` to match your cluster
 **exactly** — this touches Spark internal datasource classes and Delta internal
