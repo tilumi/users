@@ -29,11 +29,13 @@ class MultiDeltaWriterFactory(
     dropRoute: Boolean,
     basePath: String,
     parquetFactory: OutputWriterFactory,
-    serConf: SerializableConfiguration) extends DataWriterFactory {
+    serConf: SerializableConfiguration,
+    maxRecordsPerFile: Long) extends DataWriterFactory {
 
   override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] =
     new MultiDeltaDataWriter(
-      partitionId, taskId, fullSchema, writeSchema, routeIdx, dropRoute, basePath, parquetFactory, serConf)
+      partitionId, taskId, fullSchema, writeSchema, routeIdx, dropRoute, basePath,
+      parquetFactory, serConf, maxRecordsPerFile)
 }
 
 /**
@@ -50,7 +52,8 @@ class MultiDeltaDataWriter(
     dropRoute: Boolean,
     basePath: String,
     parquetFactory: OutputWriterFactory,
-    serConf: SerializableConfiguration) extends DataWriter[InternalRow] {
+    serConf: SerializableConfiguration,
+    maxRecordsPerFile: Long) extends DataWriter[InternalRow] {
 
   private val hadoopConf = serConf.value
   private val routeType  = fullSchema(routeIdx).dataType
@@ -65,8 +68,15 @@ class MultiDeltaDataWriter(
       (row: InternalRow) => proj(row)
     } else identity
 
-  // table name -> (open writer, absolute file path)
-  private val writers = mutable.Map.empty[String, (OutputWriter, String)]
+  /** The currently-open Parquet file for one table, plus its running row count. */
+  private final class OpenFile(val writer: OutputWriter, val absPath: String) {
+    var count: Long = 0L
+  }
+
+  // table name -> the file currently being written for it
+  private val open = mutable.Map.empty[String, OpenFile]
+  // files already closed this task (from rolling); reported at commit()
+  private val closed = mutable.ArrayBuffer.empty[WrittenFile]
 
   private def routeValue(row: InternalRow): String =
     row.get(routeIdx, routeType) match {
@@ -75,39 +85,54 @@ class MultiDeltaDataWriter(
       case other         => String.valueOf(other)
     }
 
-  private def writerFor(table: String): OutputWriter =
-    writers.get(table).map(_._1).getOrElse {
-      val dir = new Path(s"$basePath/$table")
-      val fs  = dir.getFileSystem(hadoopConf)
-      if (!fs.exists(dir)) fs.mkdirs(dir)
-      val name    = f"part-$partitionId%05d-$taskId-${UUID.randomUUID()}.parquet"
-      val absPath = new Path(dir, name).toString
-      val writer  = parquetFactory.newInstance(absPath, writeSchema, newTaskAttemptContext())
-      writers(table) = (writer, absPath)
-      writer
-    }
-
-  override def write(record: InternalRow): Unit =
-    writerFor(routeValue(record)).write(project(record))
-
-  override def commit(): WriterCommitMessage = {
-    val written = writers.map { case (table, (writer, absPath)) =>
-      writer.close()
-      val p  = new Path(absPath)
-      val st = p.getFileSystem(hadoopConf).getFileStatus(p)
-      WrittenFile(table, p.getName, st.getLen, st.getModificationTime)
-    }.toSeq
-    MultiDeltaCommitMessage(written)
+  private def openNew(table: String): OpenFile = {
+    val dir = new Path(s"$basePath/$table")
+    val fs  = dir.getFileSystem(hadoopConf)
+    if (!fs.exists(dir)) fs.mkdirs(dir)
+    val name    = f"part-$partitionId%05d-$taskId-${UUID.randomUUID()}.parquet"
+    val absPath = new Path(dir, name).toString
+    val writer  = parquetFactory.newInstance(absPath, writeSchema, newTaskAttemptContext())
+    new OpenFile(writer, absPath)
   }
 
-  override def abort(): Unit =
-    writers.foreach { case (_, (writer, absPath)) =>
-      try writer.close() catch { case _: Throwable => }
-      try { val p = new Path(absPath); p.getFileSystem(hadoopConf).delete(p, false) }
-      catch { case _: Throwable => }
-    }
+  /** Close one file and record it for the commit message. */
+  private def closeFile(table: String, of: OpenFile): Unit = {
+    of.writer.close()
+    val p  = new Path(of.absPath)
+    val st = p.getFileSystem(hadoopConf).getFileStatus(p)
+    closed += WrittenFile(table, p.getName, st.getLen, st.getModificationTime)
+  }
 
-  override def close(): Unit = writers.clear()
+  override def write(record: InternalRow): Unit = {
+    val table = routeValue(record)
+    val of = open.getOrElseUpdate(table, openNew(table))
+    of.writer.write(project(record))
+    of.count += 1
+    // Roll to a fresh file once this file hits the cap.
+    if (maxRecordsPerFile > 0 && of.count >= maxRecordsPerFile) {
+      closeFile(table, of)
+      open.remove(table)
+    }
+  }
+
+  override def commit(): WriterCommitMessage = {
+    open.foreach { case (table, of) => closeFile(table, of) }
+    open.clear()
+    MultiDeltaCommitMessage(closed.toSeq)
+  }
+
+  override def abort(): Unit = {
+    def del(path: String): Unit =
+      try { val p = new Path(path); p.getFileSystem(hadoopConf).delete(p, false) }
+      catch { case _: Throwable => }
+    open.foreach { case (_, of) =>
+      try of.writer.close() catch { case _: Throwable => }
+      del(of.absPath)
+    }
+    closed.foreach(wf => del(s"$basePath/${wf.table}/${wf.name}"))
+  }
+
+  override def close(): Unit = open.clear()
 
   // A Parquet OutputWriter needs a TaskAttemptContext; synthesize a unique one.
   private def newTaskAttemptContext(): TaskAttemptContextImpl = {

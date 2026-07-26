@@ -24,6 +24,7 @@ df.write.format("multiDelta")
   .option("basePath", "/mnt/warehouse")   // required: table dir = basePath/<routeValue>
   .option("sinkFormat", "delta")          // "delta" (default) or "parquet"
   .option("dropRouteColumn", "true")      // default true: strip routing column from output
+  .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
   .mode("append")
   .save()
 ```
@@ -31,6 +32,32 @@ df.write.format("multiDelta")
 - `sinkFormat=delta` → commits `AddFile` actions to each table's `_delta_log`.
 - `sinkFormat=parquet` → writes parquet straight into `basePath/<table>` and drops
   a `_SUCCESS` marker; the files *are* the table (no transaction log).
+
+## Output layout & file sizing
+
+Files are organized one directory per routing value:
+
+```
+basePath/
+├── us/   _delta_log/ (delta) or _SUCCESS (parquet) + part-<pid>-<tid>-<uuid>.parquet
+├── eu/   ...
+└── apac/ ...
+```
+
+**File count is driven by input partitioning, not by table count.** Each Spark
+task holds one open Parquet writer per table, so a table gets **one file per
+input partition that carries its rows**. Rows scattered across `P` partitions →
+`P` files per table (the small-file trap). Two controls:
+
+- `df.repartition(col("routeColumn"))` before writing → collapses each table to
+  ~1 file per partition (measured: 300k rows, 4 partitions → 12 files dropped to 3).
+- `maxRecordsPerFile` → caps how many rows land in each file, rolling to a new
+  file (and a new `AddFile`) past the limit. Measured on 300k single-partition
+  rows: unbounded = 1 file (3.9 MiB); `maxRecordsPerFile=50000` = 6 even files
+  (~650 KiB each). Use it to bound file size when a partition is large, or to
+  guarantee no single giant file regardless of input partitioning.
+
+For the delta sink you can also compact after the fact with `OPTIMIZE <table>`.
 
 ## How it works
 

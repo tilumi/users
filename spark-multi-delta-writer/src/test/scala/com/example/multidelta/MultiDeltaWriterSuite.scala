@@ -130,6 +130,27 @@ class MultiDeltaWriterSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(counter.value === 4L)
   }
 
+  test("maxRecordsPerFile rolls each table into multiple bounded files") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    // 25 us rows in a single partition -> with cap 10 that's 3 files (10,10,5).
+    val df = (1 to 25).map(i => ("us", i)).toDF("region", "id").repartition(1)
+
+    df.write.format("multiDelta")
+      .option("routeColumn", "region").option("basePath", base)
+      .option("maxRecordsPerFile", "10")
+      .mode("append").save()
+
+    val conf = spark.sessionState.newHadoopConf()
+    val dir = new Path(s"$base/us")
+    val parquetFiles = dir.getFileSystem(conf).listStatus(dir)
+      .filter(s => s.getPath.getName.endsWith(".parquet"))
+
+    assert(parquetFiles.length === 3, "25 rows / cap 10 should produce 3 files")
+    // Every committed AddFile is honored on read-back, and total rows preserved.
+    assert(spark.read.format("delta").load(s"$base/us").count() === 25)
+  }
+
   test("missing required options fail fast") {
     val base = tmpDir()
     val e = intercept[Exception] {

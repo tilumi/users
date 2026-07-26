@@ -85,6 +85,9 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
   private val basePath    = required("basePath").stripSuffix("/")
   private val sinkFormat  = Option(opts.get("sinkFormat")).getOrElse("delta").toLowerCase
   private val dropRoute   = opts.getBoolean("dropRouteColumn", true)
+  // 0 (default) = unbounded: all rows for a table within a task go to one file.
+  // >0 = roll to a new file (and a new AddFile) after this many records.
+  private val maxRecordsPerFile = opts.getLong("maxRecordsPerFile", 0L)
 
   private val routeIdx = fullSchema.fieldIndex(routeColumn)
 
@@ -111,7 +114,8 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo) extends BatchWrite {
     Option(opts.get(key)).getOrElse(throw new IllegalArgumentException(s"Option '$key' is required"))
 
   override def createBatchWriterFactory(pInfo: PhysicalWriteInfo): DataWriterFactory =
-    new MultiDeltaWriterFactory(fullSchema, writeSchema, routeIdx, dropRoute, basePath, parquetFactory, serConf)
+    new MultiDeltaWriterFactory(
+      fullSchema, writeSchema, routeIdx, dropRoute, basePath, parquetFactory, serConf, maxRecordsPerFile)
 
   override def useCommitCoordinator(): Boolean = false
 
