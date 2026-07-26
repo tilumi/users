@@ -139,6 +139,8 @@ To get the same even, target-sized files in a single pass:
 
 ## How it works
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for component/sequence/data-flow diagrams.
+
 | Stage | Where | What |
 |-------|-------|------|
 | `MultiDeltaSource` / `Table` / `WriteBuilder` | driver | DSv2 plumbing; pulls the query schema |
