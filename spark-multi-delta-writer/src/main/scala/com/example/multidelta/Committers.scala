@@ -51,7 +51,8 @@ object DeltaCommitter {
           partitionValues  = f.partitionValues,
           size             = f.size,
           modificationTime = f.modificationTime,
-          dataChange       = true)
+          dataChange       = true,
+          stats            = f.stats)            // null when collectStats is off
       }
 
       val removes: Seq[Action] =

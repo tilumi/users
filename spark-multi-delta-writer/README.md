@@ -27,6 +27,7 @@ df.write.format("multiDelta")
   .option("partitionBy", "dt,country")    // Hive-style partition columns applied to every table
   .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
   .option("sortWithinPartitions", "true") // local-sort by route+partition cols; 1 open writer at a time
+  .option("collectStats", "true")         // default true: write Delta min/max/nullCount stats (delta sink)
   .mode("append")                         // or "overwrite" (replaces only touched tables)
   .save()
 ```
@@ -158,10 +159,11 @@ sbt test      # runs MultiDeltaWriterSuite against a local SparkSession
 ## Validation status
 
 Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
-(Scala 2.12.18). All 13 cases in `MultiDeltaWriterSuite` pass — delta & parquet
+(Scala 2.12.18). All 15 cases in `MultiDeltaWriterSuite` pass — delta & parquet
 routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
 **partitioned** tables (delta + parquet), **overwrite** mode (selective replace
 + stale-file removal), `sortWithinPartitions` (bounded writers, data preserved),
+**per-file stats** (min/max/nullCount emitted, skipping stays correct),
 partition-type validation, fail-fast on missing options, and the **single-pass**
 guarantee (4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
 
@@ -172,10 +174,21 @@ Pin `sparkVersion` / `deltaVersion` in `build.sbt` to match your cluster
 **exactly** — this touches Spark internal datasource classes and Delta internal
 transaction APIs, neither of which is source-stable across major versions.
 
+## Data skipping (per-file stats)
+
+With `collectStats=true` (default, delta sink only) the writer computes
+`numRecords` + `minValues` / `maxValues` / `nullCount` per file and writes them
+into `AddFile.stats`, so Delta prunes files at query time. Stats are collected in
+the same single pass — no extra scan.
+
+Indexed types: integral, float/double (columns with NaN/Inf drop their min/max),
+string, and date (encoded as `yyyy-MM-dd`). Other types (timestamp, decimal,
+boolean, nested) get no min/max — safe by construction: every emitted bound is a
+true lower/upper bound, so skipping can never drop a valid row. `nullCount` is
+tracked for all indexed columns. Set `collectStats=false` to skip the work.
+
 ## Known limitations (extension points)
 
-- **No per-file Delta stats.** `AddFile.stats` is left null (data skipping still
-  works via file pruning, just less selectively). Populate it for better skipping.
 - **Sequential commits.** Tables commit one-by-one on the driver; wrap
   `DeltaCommitter` in a `Future` pool if commit latency matters.
 - **String routing column** assumed; extend `routeValue` for other types.

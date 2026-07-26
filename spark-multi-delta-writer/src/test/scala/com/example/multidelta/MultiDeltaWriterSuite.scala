@@ -273,6 +273,39 @@ class MultiDeltaWriterSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(countParquet(new Path(base)) < 120, "local sort should keep files grouped, not fragmented")
   }
 
+  test("collectStats writes Delta min/max/nullCount; skipping stays correct") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    // ids 1..100 into 'us', every 10th name null, across 4 files
+    val df = (1 to 100).map(i => (i, "us", if (i % 10 == 0) null.asInstanceOf[String] else s"n$i"))
+      .toDF("id", "region", "name").repartition(4)
+    df.write.format("multiDelta")
+      .option("routeColumn", "region").option("basePath", base).mode("append").save()
+
+    // every committed AddFile carries valid stats JSON with numRecords + min/max on id
+    val snap = org.apache.spark.sql.delta.DeltaLog.forTable(spark, s"$base/us").update()
+    val files = snap.allFiles.collect()
+    assert(files.nonEmpty)
+    assert(files.forall(a => a.stats != null &&
+      a.stats.contains("numRecords") && a.stats.contains("minValues") && a.stats.contains("\"id\"")))
+
+    // data skipping (driven by those stats) must not drop valid rows
+    val us = spark.read.format("delta").load(s"$base/us")
+    assert(us.where($"id" === 42).count() === 1)
+    assert(us.where($"id" > 90).count() === 10)
+    assert(us.where($"name".isNull).count() === 10) // nullCount stat is correct
+  }
+
+  test("collectStats=false omits stats") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    (1 to 20).map(i => (i, "us")).toDF("id", "region")
+      .write.format("multiDelta").option("routeColumn", "region")
+      .option("basePath", base).option("collectStats", "false").mode("append").save()
+    val files = org.apache.spark.sql.delta.DeltaLog.forTable(spark, s"$base/us").update().allFiles.collect()
+    assert(files.nonEmpty && files.forall(_.stats == null))
+  }
+
   test("missing required options fail fast") {
     val base = tmpDir()
     val e = intercept[Exception] {

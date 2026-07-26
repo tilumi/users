@@ -125,6 +125,9 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
   // When true, input is locally sorted by [routeColumn, partitionCols] (see MultiDeltaWrite),
   // so the writer holds one open file at a time.
   private val sortWithinPartitions = opts.getBoolean("sortWithinPartitions", false)
+  // Per-file Delta stats (min/max/nullCount) for data skipping. Only meaningful for the
+  // delta sink; the parquet sink ignores AddFile stats, so we skip the CPU there.
+  private val collectStats = opts.getBoolean("collectStats", true)
   private val partitionCols: Seq[String] =
     Option(opts.get("partitionBy"))
       .map(_.split(",").map(_.trim).filter(_.nonEmpty).toSeq).getOrElse(Nil)
@@ -175,7 +178,8 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
   override def createBatchWriterFactory(pInfo: PhysicalWriteInfo): DataWriterFactory =
     new MultiDeltaWriterFactory(
       fullSchema, dataSchema, routeIdx, dropRoute, partitionCols.toArray, partitionIdxInFull,
-      basePath, parquetFactory, serConf, maxRecordsPerFile, sortWithinPartitions)
+      basePath, parquetFactory, serConf, maxRecordsPerFile, sortWithinPartitions,
+      collectStats && sinkFormat == "delta")
 
   override def useCommitCoordinator(): Boolean = false
 

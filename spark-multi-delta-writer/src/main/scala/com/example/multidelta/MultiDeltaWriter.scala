@@ -28,7 +28,8 @@ case class WrittenFile(
     name: String,
     size: Long,
     modificationTime: Long,
-    partitionValues: Map[String, String]) {
+    partitionValues: Map[String, String],
+    stats: String = null) {
   def relPath: String = if (subPath.isEmpty) name else s"$subPath/$name"
 }
 
@@ -47,13 +48,14 @@ class MultiDeltaWriterFactory(
     parquetFactory: OutputWriterFactory,
     serConf: SerializableConfiguration,
     maxRecordsPerFile: Long,
-    sortedMode: Boolean) extends DataWriterFactory {
+    sortedMode: Boolean,
+    collectStats: Boolean) extends DataWriterFactory {
 
   override def createWriter(partitionId: Int, taskId: Long): DataWriter[InternalRow] =
     new MultiDeltaDataWriter(
       partitionId, taskId, fullSchema, dataSchema, routeIdx, dropRoute,
       partitionColNames, partitionIdxInFull, basePath, parquetFactory, serConf,
-      maxRecordsPerFile, sortedMode)
+      maxRecordsPerFile, sortedMode, collectStats)
 }
 
 /**
@@ -75,7 +77,8 @@ class MultiDeltaDataWriter(
     parquetFactory: OutputWriterFactory,
     serConf: SerializableConfiguration,
     maxRecordsPerFile: Long,
-    sortedMode: Boolean) extends DataWriter[InternalRow] {
+    sortedMode: Boolean,
+    collectStats: Boolean) extends DataWriter[InternalRow] {
 
   private val hadoopConf = serConf.value
   private val routeType  = fullSchema(routeIdx).dataType
@@ -92,12 +95,137 @@ class MultiDeltaDataWriter(
     (row: InternalRow) => proj(row)
   }
 
+  // ---- per-file Delta statistics (numRecords / minValues / maxValues / nullCount) ----
+  // Only top-level columns of a safe type are indexed, and every encoding is a TRUE
+  // bound (min <= all values, max >= all values) so data skipping can never drop a
+  // valid row. Unhandled types simply get no min/max (skipping just won't use them).
+  // code: 0 = integral(as Long)  1 = float/double  2 = string  3 = date
+  private val statCols: Array[(Int, String, Byte)] =
+    if (!collectStats) Array.empty
+    else dataSchema.fields.zipWithIndex.flatMap { case (f, i) =>
+      val code: Byte = f.dataType match {
+        case ByteType | ShortType | IntegerType | LongType => 0
+        case FloatType | DoubleType                        => 1
+        case StringType                                    => 2
+        case DateType                                      => 3
+        case _                                             => -1
+      }
+      if (code >= 0) Some((i, f.name, code)) else None
+    }
+
+  private def integralAt(row: InternalRow, idx: Int): Long = dataSchema(idx).dataType match {
+    case ByteType    => row.getByte(idx).toLong
+    case ShortType   => row.getShort(idx).toLong
+    case IntegerType => row.getInt(idx).toLong
+    case _           => row.getLong(idx)
+  }
+  private def doubleAt(row: InternalRow, idx: Int): Double =
+    if (dataSchema(idx).dataType == FloatType) row.getFloat(idx).toDouble else row.getDouble(idx)
+
+  private def jsonStr(s: String): String = {
+    val sb = new StringBuilder(s.length + 2); sb.append('"')
+    var i = 0
+    while (i < s.length) {
+      s.charAt(i) match {
+        case '"'  => sb.append("\\\"")
+        case '\\' => sb.append("\\\\")
+        case '\n' => sb.append("\\n")
+        case '\r' => sb.append("\\r")
+        case '\t' => sb.append("\\t")
+        case '\b' => sb.append("\\b")
+        case '\f' => sb.append("\\f")
+        case c if c < 0x20 => sb.append("\\u%04x".format(c.toInt))
+        case c => sb.append(c)
+      }
+      i += 1
+    }
+    sb.append('"').toString
+  }
+
+  /** Accumulates Delta stats for one file. Reads values out of the projected row
+    * immediately (before the next projection overwrites it); strings are deep-copied. */
+  private final class FileStats {
+    private val n = statCols.length
+    private val nullCount = new Array[Long](n)
+    private val seen = new Array[Boolean](n)
+    private val bad  = new Array[Boolean](n) // NaN/Inf seen -> drop min/max for the column
+    private val lMin = new Array[Long](n);        private val lMax = new Array[Long](n)
+    private val dMin = new Array[Double](n);      private val dMax = new Array[Double](n)
+    private val sMin = new Array[UTF8String](n);  private val sMax = new Array[UTF8String](n)
+    var numRecords = 0L
+
+    def update(row: InternalRow): Unit = {
+      numRecords += 1
+      var k = 0
+      while (k < n) {
+        val (idx, _, code) = statCols(k)
+        if (row.isNullAt(idx)) nullCount(k) += 1
+        else code match {
+          case 0 | 3 =>
+            val v = if (code == 3) row.getInt(idx).toLong else integralAt(row, idx)
+            if (!seen(k)) { lMin(k) = v; lMax(k) = v }
+            else { if (v < lMin(k)) lMin(k) = v; if (v > lMax(k)) lMax(k) = v }
+            seen(k) = true
+          case 1 =>
+            val v = doubleAt(row, idx)
+            if (v.isNaN || v.isInfinite) bad(k) = true
+            else {
+              if (!seen(k)) { dMin(k) = v; dMax(k) = v }
+              else { if (v < dMin(k)) dMin(k) = v; if (v > dMax(k)) dMax(k) = v }
+              seen(k) = true
+            }
+          case _ => // string
+            val c = UTF8String.fromBytes(row.getUTF8String(idx).getBytes) // deep copy
+            if (!seen(k)) { sMin(k) = c; sMax(k) = c }
+            else { if (c.compareTo(sMin(k)) < 0) sMin(k) = c; if (c.compareTo(sMax(k)) > 0) sMax(k) = c }
+            seen(k) = true
+        }
+        k += 1
+      }
+    }
+
+    def toJson: String = {
+      val sb = new StringBuilder(64)
+      sb.append("{\"numRecords\":").append(numRecords)
+      appendMap(sb, "minValues", min = true)
+      appendMap(sb, "maxValues", min = false)
+      sb.append(",\"nullCount\":{")
+      var first = true; var k = 0
+      while (k < n) {
+        if (!first) sb.append(','); first = false
+        sb.append(jsonStr(statCols(k)._2)).append(':').append(nullCount(k)); k += 1
+      }
+      sb.append("}}").toString
+    }
+
+    private def appendMap(sb: StringBuilder, field: String, min: Boolean): Unit = {
+      sb.append(",\"").append(field).append("\":{")
+      var first = true; var k = 0
+      while (k < n) {
+        if (seen(k) && !bad(k)) {
+          if (!first) sb.append(','); first = false
+          val (_, name, code) = statCols(k)
+          sb.append(jsonStr(name)).append(':')
+          code match {
+            case 0 => sb.append(if (min) lMin(k) else lMax(k))
+            case 3 => sb.append(jsonStr(java.time.LocalDate.ofEpochDay(if (min) lMin(k) else lMax(k)).toString))
+            case 1 => sb.append(if (min) dMin(k) else dMax(k))
+            case _ => sb.append(jsonStr((if (min) sMin(k) else sMax(k)).toString))
+          }
+        }
+        k += 1
+      }
+      sb.append('}')
+    }
+  }
+
   /** The currently-open Parquet file for one (table, partition) key. */
   private final class OpenFile(
       val writer: OutputWriter,
       val absPath: String,
       val subPath: String,
-      val partitionValues: Map[String, String]) {
+      val partitionValues: Map[String, String],
+      val stats: FileStats) {
     var count: Long = 0L
   }
 
@@ -149,14 +277,15 @@ class MultiDeltaDataWriter(
     val name    = f"part-$partitionId%05d-$taskId-${UUID.randomUUID()}.parquet"
     val absPath = new Path(dir, name).toString
     val writer  = parquetFactory.newInstance(absPath, dataSchema, newTaskAttemptContext())
-    new OpenFile(writer, absPath, subPath, partValues)
+    new OpenFile(writer, absPath, subPath, partValues, new FileStats)
   }
 
   private def closeFile(of: OpenFile, table: String): Unit = {
     of.writer.close()
     val p  = new Path(of.absPath)
     val st = p.getFileSystem(hadoopConf).getFileStatus(p)
-    closed += WrittenFile(table, of.subPath, p.getName, st.getLen, st.getModificationTime, of.partitionValues)
+    val stats = if (collectStats) of.stats.toJson else null
+    closed += WrittenFile(table, of.subPath, p.getName, st.getLen, st.getModificationTime, of.partitionValues, stats)
   }
 
   override def write(record: InternalRow): Unit = {
@@ -171,7 +300,9 @@ class MultiDeltaDataWriter(
       open.clear()
     }
     val of = open.getOrElseUpdate(key, openNew(table, subPath, partValues))
-    of.writer.write(project(record))
+    val projected = project(record)
+    of.writer.write(projected)
+    if (collectStats) of.stats.update(projected)
     of.count += 1
     if (maxRecordsPerFile > 0 && of.count >= maxRecordsPerFile) {
       closeFile(of, table)
