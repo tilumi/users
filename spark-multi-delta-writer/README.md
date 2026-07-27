@@ -212,6 +212,13 @@ dominate it is a low-single-digit fraction, which is why it defaults on.
 
 ## Known limitations (extension points)
 
+- **Only `Append` and `Overwrite` save modes.** As a path-based DataSource V2
+  sink it exposes `BATCH_WRITE` (Append) and `SupportsTruncate` (Overwrite). The
+  default `ErrorIfExists` and `Ignore` need a table-existence check a V2 path sink
+  has no concept of, so Spark rejects them at analysis time — **you must set
+  `.mode("append")` or `.mode("overwrite")` explicitly** (a bare `.save()` fails).
+  For `Ignore`/`ErrorIfExists` semantics, check the path yourself before writing or
+  add a catalog (`SupportsCatalogOptions`).
 - **Sequential commits.** Tables commit one-by-one on the driver; wrap
   `DeltaCommitter` in a `Future` pool if commit latency matters.
 - **String routing column** assumed; extend `routeValue` for other types.
