@@ -273,6 +273,70 @@ class MultiDeltaWriterSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(countParquet(new Path(base)) < 120, "local sort should keep files grouped, not fragmented")
   }
 
+  test("replaceWhere: selective overwrite replaces only the matching partition") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    // seed us + eu, each with dt=2021 and dt=2022
+    Seq(("us","2021","a1"),("us","2022","b1"),("eu","2021","c1"),("eu","2022","d1"))
+      .toDF("region","dt","name")
+      .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+      .option("partitionBy","dt").mode("append").save()
+
+    // reload only dt=2021 for us
+    Seq(("us","2021","a1_new"),("us","2021","a2_new"))
+      .toDF("region","dt","name")
+      .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+      .option("partitionBy","dt").option("replaceWhere","dt = '2021'").mode("overwrite").save()
+
+    val us = spark.read.format("delta").load(s"$base/us")
+    assert(us.where($"dt" === "2021").select("name").as[String].collect().toSet === Set("a1_new","a2_new"))
+    assert(us.where($"dt" === "2022").select("name").as[String].collect().toSeq === Seq("b1")) // untouched
+    assert(us.count() === 3)
+    // eu received no rows in the 2nd write -> entirely untouched
+    assert(spark.read.format("delta").load(s"$base/eu").count() === 2)
+  }
+
+  test("replaceWhere: rejects incoming data outside the predicate region (table unchanged)") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    Seq(("us","2021","orig")).toDF("region","dt","name")
+      .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+      .option("partitionBy","dt").mode("append").save()
+
+    val ex = intercept[Exception] {
+      Seq(("us","2021","ok"),("us","2022","outside")) // 2022 violates dt = '2021'
+        .toDF("region","dt","name")
+        .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+        .option("partitionBy","dt").option("replaceWhere","dt = '2021'").mode("overwrite").save()
+    }
+    assert(ex.getMessage.contains("replaceWhere") || ex.getCause != null)
+    // original data intact — the write aborted before committing
+    val us = spark.read.format("delta").load(s"$base/us")
+    assert(us.select("name").as[String].collect().toSeq === Seq("orig"))
+  }
+
+  test("replaceWhere: a data-column predicate fails fast") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    val ex = intercept[Exception] {
+      Seq(("us","2021","x")).toDF("region","dt","name")
+        .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+        .option("partitionBy","dt").option("replaceWhere","name = 'x'").mode("overwrite").save()
+    }
+    assert((ex.getMessage + Option(ex.getCause).map(_.getMessage).getOrElse("")).contains("partition"))
+  }
+
+  test("replaceWhere without overwrite mode fails") {
+    val base = tmpDir()
+    val ss = spark; import ss.implicits._
+    val ex = intercept[Exception] {
+      Seq(("us","2021","x")).toDF("region","dt","name")
+        .write.format("multiDelta").option("routeColumn","region").option("basePath",base)
+        .option("partitionBy","dt").option("replaceWhere","dt = '2021'").mode("append").save()
+    }
+    assert((ex.getMessage + Option(ex.getCause).map(_.getMessage).getOrElse("")).contains("overwrite"))
+  }
+
   test("collectStats writes Delta min/max/nullCount; skipping stays correct") {
     val base = tmpDir()
     val ss = spark; import ss.implicits._

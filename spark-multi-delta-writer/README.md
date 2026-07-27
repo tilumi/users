@@ -28,7 +28,8 @@ df.write.format("multiDelta")
   .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
   .option("sortWithinPartitions", "true") // local-sort by route+partition cols; 1 open writer at a time
   .option("collectStats", "true")         // default true: write Delta min/max/nullCount stats (delta sink)
-  .mode("append")                         // or "overwrite" (replaces only touched tables)
+  .option("replaceWhere", "dt = '2026-07-01'") // optional: selective overwrite by a partition predicate
+  .mode("append")                         // or "overwrite" (full-table, or scoped when replaceWhere is set)
   .save()
 ```
 
@@ -166,11 +167,12 @@ equivalent `build.sbt` is included if you prefer sbt.
 ## Validation status
 
 Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
-(Scala 2.12.18). All 15 cases in `MultiDeltaWriterSuite` pass — delta & parquet
+(Scala 2.12.18). All 19 cases in `MultiDeltaWriterSuite` pass — delta & parquet
 routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
 **partitioned** tables (delta + parquet), **overwrite** mode (selective replace
-+ stale-file removal), `sortWithinPartitions` (bounded writers, data preserved),
-**per-file stats** (min/max/nullCount emitted, skipping stays correct),
++ stale-file removal), **`replaceWhere`** (scoped overwrite, constraint enforcement,
+data-column + append-mode rejection), `sortWithinPartitions` (bounded writers, data
+preserved), **per-file stats** (min/max/nullCount emitted, skipping stays correct),
 partition-type validation, fail-fast on missing options, and the **single-pass**
 guarantee (4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
 
@@ -210,6 +212,32 @@ strings). On a deliberately cheap local write (2M rows, local SSD) stats added
 ~15–18% of write time; on real object-store writes where Parquet encoding + IO
 dominate it is a low-single-digit fraction, which is why it defaults on.
 
+## Selective overwrite (`replaceWhere`)
+
+Replace just the rows matching a **partition** predicate, per table, in one pass —
+the idempotent-reload pattern (re-run for one date, replace only that date, keep the
+rest of history):
+
+```scala
+df.write.format("multiDelta")
+  .option("routeColumn", "forest")
+  .option("basePath", base)
+  .option("partitionBy", "snapshotDate")
+  .option("replaceWhere", "snapshotDate = '2026-07-01'")
+  .mode("overwrite")            // required — replaceWhere only applies to overwrite
+  .save()
+```
+
+Semantics (matching Delta's original partition-scoped `replaceWhere`):
+
+- Per table, removes only the files whose partition matches the predicate, then adds
+  the new files — untouched partitions and tables that received no rows are left alone.
+- **Enforced:** every incoming row must satisfy the predicate. A row outside the region
+  aborts the whole write *before any table commits* (no partial result).
+- The predicate must reference **partition columns only** — data-column predicates throw
+  a clear error on the driver (fail-fast, before executors run). It also requires the
+  delta sink and `mode("overwrite")`.
+
 ## Known limitations (extension points)
 
 - **Only `Append` and `Overwrite` save modes.** As a path-based DataSource V2
@@ -219,6 +247,10 @@ dominate it is a low-single-digit fraction, which is why it defaults on.
   `.mode("append")` or `.mode("overwrite")` explicitly** (a bare `.save()` fails).
   For `Ignore`/`ErrorIfExists` semantics, check the path yourself before writing or
   add a catalog (`SupportsCatalogOptions`).
+- **`replaceWhere` is partition-columns only.** Predicates over data columns are
+  rejected up-front (they'd need surviving rows rewritten out of partially-matching
+  files — a data-loss risk if done wrong). Partition predicates are safe: a file is
+  wholly in or out of the region. See the Selective overwrite section.
 - **Sequential commits.** Tables commit one-by-one on the driver; wrap
   `DeltaCommitter` in a `Future` pool if commit latency matters.
 - **String routing column** assumed; extend `routeValue` for other types.

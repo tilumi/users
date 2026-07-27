@@ -172,6 +172,19 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
     new ParquetFileFormat().prepareWrite(spark, job, Map.empty[String, String], dataSchema)
   private val serConf = new SerializableConfiguration(job.getConfiguration)
 
+  // Selective overwrite. Requires delta sink + overwrite mode, and (see ReplaceWhere)
+  // a predicate over partition columns only. Resolved here so a bad predicate fails on
+  // the driver before any executor runs.
+  private val replaceWhere: Option[String] =
+    Option(opts.get("replaceWhere")).map(_.trim).filter(_.nonEmpty)
+  replaceWhere.foreach { rw =>
+    if (sinkFormat != "delta")
+      throw new IllegalArgumentException("replaceWhere is only supported for the delta sink")
+    if (!overwrite)
+      throw new IllegalArgumentException("""replaceWhere requires mode("overwrite")""")
+    ReplaceWhere.resolve(spark, tableSchema, partitionCols, rw) // validate now, discard
+  }
+
   private def required(key: String): String =
     Option(opts.get(key)).getOrElse(throw new IllegalArgumentException(s"Option '$key' is required"))
 
@@ -192,7 +205,7 @@ class MultiDeltaBatchWrite(info: LogicalWriteInfo, overwrite: Boolean) extends B
 
     sinkFormat match {
       case "delta" =>
-        DeltaCommitter.commitAll(spark, basePath, tableSchema, partitionCols, addsByTable, overwrite)
+        DeltaCommitter.commitAll(spark, basePath, tableSchema, partitionCols, addsByTable, overwrite, replaceWhere)
       case "parquet" =>
         ParquetCommitter.finalizeAll(serConf, basePath, addsByTable, overwrite)
       case other =>
