@@ -1,0 +1,262 @@
+# spark-multi-delta-writer
+
+A DataSource V2 sink that fans **one DataFrame out to many tables in a single
+Spark job / single pass over the data**, routing each row to a target table by a
+routing column. Supports **Delta** and **pure Parquet** sinks.
+
+## Why this exists
+
+Calling `df.write` once per table is slow because each call is a separate Spark
+action: the upstream DAG is recomputed, jobs run sequentially, and (even cached)
+the data is re-scanned once per table. This sink scans/computes the source
+**once** and writes every table's files from the same task set.
+
+Trade-off, accepted by design: writes are **not atomic across tables**. Each
+Delta table is committed with its own transaction; a mid-commit failure leaves
+partial state. Make upstream writes idempotent (e.g. `MERGE` on a key, or Delta
+`txnAppId`/`txnVersion`) if you need convergence on retry.
+
+## Usage
+
+```scala
+df.write.format("multiDelta")
+  .option("routeColumn", "target_table")  // required: value of this column picks the table
+  .option("basePath", "/mnt/warehouse")   // required: table dir = basePath/<routeValue>
+  .option("sinkFormat", "delta")          // "delta" (default) or "parquet"
+  .option("dropRouteColumn", "true")      // default true: strip routing column from output
+  .option("partitionBy", "dt,country")    // Hive-style partition columns applied to every table
+  .option("maxRecordsPerFile", "1000000") // 0 (default) = unbounded; >0 rolls files at this row count
+  .option("sortWithinPartitions", "true") // local-sort by route+partition cols; 1 open writer at a time
+  .option("collectStats", "true")         // default true: write Delta min/max/nullCount stats (delta sink)
+  .option("replaceWhere", "dt = '2026-07-01'") // optional: selective overwrite by a partition predicate
+  .mode("append")                         // or "overwrite" (full-table, or scoped when replaceWhere is set)
+  .save()
+```
+
+- `sinkFormat=delta` → commits `AddFile` actions to each table's `_delta_log`.
+- `sinkFormat=parquet` → writes parquet straight into `basePath/<table>` and drops
+  a `_SUCCESS` marker; the files *are* the table (no transaction log).
+
+### Partitioning
+
+`partitionBy` writes standard Hive-style `col=value/` subdirectories under each
+table and records the values in `AddFile.partitionValues` (delta) — so reads
+prune partitions normally, and the parquet sink is discovered by Spark's usual
+partition inference. Partition columns live in the path, not the data files.
+Supported partition types: string / boolean / integral (date & timestamp need
+custom value formatting and are rejected up-front).
+
+### Overwrite mode
+
+`mode("overwrite")` replaces the contents of **only the tables that receive rows
+in this write** — untouched tables are left alone. Delta does it transactionally
+(`RemoveFile` for the current files + the new `AddFile`s in one commit); the
+parquet sink deletes pre-existing files not written by this commit.
+
+## Output layout & file sizing
+
+Files are organized one directory per routing value:
+
+```
+basePath/
+├── us/   _delta_log/ (delta) or _SUCCESS (parquet) + part-<pid>-<tid>-<uuid>.parquet
+├── eu/   ...
+└── apac/ ...
+```
+
+**File count is driven by input partitioning, not by table count.** Each Spark
+task holds one open Parquet writer per table, so a table gets **one file per
+input partition that carries its rows**. Rows scattered across `P` partitions →
+`P` files per table (the small-file trap). Two controls:
+
+- `df.repartition(col("routeColumn"))` before writing → collapses each table to
+  ~1 file per partition (measured: 300k rows, 4 partitions → 12 files dropped to 3).
+  **Only safe when the routing key is not skewed** — hash-partitioning a skewed
+  key funnels the hot value into one task/file (straggler + OOM risk). Prefer the
+  `REBALANCE` hint below, which splits hot keys; see *Handling skew*.
+- `maxRecordsPerFile` → caps how many rows land in each file, rolling to a new
+  file (and a new `AddFile`) past the limit. Measured on 300k single-partition
+  rows: unbounded = 1 file (3.9 MiB); `maxRecordsPerFile=50000` = 6 even files
+  (~650 KiB each). Use it to bound file size when a partition is large, or to
+  guarantee no single giant file regardless of input partitioning.
+
+For the delta sink you can also compact after the fact with `OPTIMIZE <table>`.
+
+### Handling skew in the routing column
+
+Routing skew only hurts if you pre-shuffle by the routing key:
+
+- **Default write (no repartition):** unaffected. Tasks are sized by *input*
+  partitions, so a hot routing value just yields larger files, not a straggler.
+- **`repartition($"routeColumn")`:** dangerous under skew — all hot-value rows
+  hash to one partition, so one task writes the whole hot table (straggler; the
+  task also holds that table's full Parquet row-group buffer → OOM risk).
+- **`REBALANCE(<routeCol>)` + AQE (recommended):** AQE's
+  `optimizeSkewsInRebalancePartitions` (default on) *splits* the hot key into
+  several even, target-sized partitions written by different tasks in parallel.
+  Measured through this sink at 98% skew: `repartition` produced one 8.3 MiB hot
+  file from a single task; `REBALANCE` produced 8 even ~1 MiB files and finished
+  ~2.4× faster. Set `spark.sql.adaptive.advisoryPartitionSizeInBytes` to your
+  target file size.
+
+Two related cautions: don't set `maxRecordsPerFile` so low that a huge hot table
+emits an enormous number of `AddFile`s (bloats `_delta_log`); and note the memory
+ceiling is driven by *routing cardinality*, not skew — each task holds one open
+Parquet writer per `(table, partition)` it currently sees, so hundreds of distinct
+routing values per task means hundreds of row-group buffers.
+
+### `sortWithinPartitions` — bound writer memory for high cardinality
+
+Set `sortWithinPartitions=true` and the sink asks Spark (via DSv2
+`RequiresDistributionAndOrdering`) for a **local** sort by `[routeColumn,
+partitionCols]` before the write — no shuffle, so it does not reintroduce skew.
+Every `(table, partition)` group then arrives contiguously, and the writer keeps
+just **one** open Parquet writer at a time (closing each group as the key changes).
+Memory is bounded to a single row-group buffer regardless of routing cardinality,
+so it stays safe even without the `REBALANCE` hint. Cost: a local sort (CPU, and
+possible spill). Prefer it when a single task may see many distinct routing values;
+skip it when `REBALANCE`/repartition already clusters the data. Verified through
+the sink: interleaved 5-table input stays grouped (not fragmented) with all rows
+preserved across the group boundaries.
+
+### Interop with Synapse / Databricks "Optimized Write"
+
+Optimized Write (`spark.microsoft.delta.optimizeWrite.enabled`,
+`delta.autoOptimize.optimizeWrite`) is implemented **inside Delta's write path** —
+an adaptive shuffle injected into `TransactionalWrite.writeFiles`. This sink
+supplies its **own** write path and uses only Delta's **commit** path
+(`txn.commit`), so the `optimizeWrite` flag/table-property has **no effect here**.
+To get the same even, target-sized files in a single pass:
+
+- **`REBALANCE` hint + AQE** — `SELECT /*+ REBALANCE(<routeCol>[, <partCols>]) */`
+  before the write, with `spark.sql.adaptive.advisoryPartitionSizeInBytes` set to
+  your target file size (e.g. `128m`). AQE coalesces small tables to one file and
+  splits large ones into even chunks. Measured through this sink (skewed 400k
+  rows): the small tables dropped from 8 tiny files to 1 target-sized file each,
+  while the large table stayed evenly split — Optimized-Write-equivalent layout.
+- **`maxRecordsPerFile`** as a hard per-file cap (see above).
+- **Auto Compact** (`delta.autoOptimize.autoCompact`) is a *post-commit hook*, and
+  this sink does call `txn.commit`, so — unlike Optimized Write — it may still fire
+  for the delta sink. Enable and verify on your Synapse runtime.
+
+## How it works
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for component/sequence/data-flow diagrams.
+
+| Stage | Where | What |
+|-------|-------|------|
+| `MultiDeltaSource` / `Table` / `WriteBuilder` | driver | DSv2 plumbing; pulls the query schema |
+| `MultiDeltaBatchWrite` | driver | builds the serializable Parquet `OutputWriterFactory`, coordinates commit |
+| `MultiDeltaDataWriter` | executor | **one open Parquet writer per (table, partition dir)**, routes each row (single pass), rolls files at `maxRecordsPerFile` |
+| `DeltaCommitter` / `ParquetCommitter` | driver | finalizes each table (append/overwrite; log commit vs `_SUCCESS`) |
+
+## Build & test
+
+Maven (Java 8):
+
+```bash
+mvn package    # builds the jar (target/…-0.1.0.jar) to add with --jars
+mvn test       # runs MultiDeltaWriterSuite against a local SparkSession
+```
+
+Compiles to **Java 8 bytecode** (`-release:8`), which Spark 3.5 / Delta 3.2 support.
+The `--add-opens` flags Spark needs on JDK 9+ are wired into a `jdk9plus` profile
+that auto-activates only on JDK 9+ — on Java 8 nothing extra is passed. An
+equivalent `build.sbt` is included if you prefer sbt.
+
+## Validation status
+
+Compiled and executed end-to-end against **Spark 3.5.1 + Delta 3.2.0**
+(Scala 2.12.18). All 19 cases in `MultiDeltaWriterSuite` pass — delta & parquet
+routing, append accumulation, `dropRouteColumn`, `maxRecordsPerFile` rolling,
+**partitioned** tables (delta + parquet), **overwrite** mode (selective replace
++ stale-file removal), **`replaceWhere`** (scoped overwrite, constraint enforcement,
+data-column + append-mode rejection), `sortWithinPartitions` (bounded writers, data
+preserved), **per-file stats** (min/max/nullCount emitted, skipping stays correct),
+partition-type validation, fail-fast on missing options, and the **single-pass**
+guarantee (4 input rows across 3 target tables trigger exactly 4 row-visits, not 12).
+
+> Java: Spark 3.5 targets JDK 8/11/17. The code compiles under `-release:8` (links
+> against Java 8 APIs only) and runs on all three; the `--add-opens` flags are only
+> needed, and only applied, on JDK 9+.
+
+Pin the `spark.version` / `delta.version` in `pom.xml` (or `build.sbt`) to match
+your cluster **exactly** — this touches Spark internal datasource classes and Delta
+internal transaction APIs, neither of which is source-stable across major versions.
+
+## Data skipping (per-file stats)
+
+With `collectStats=true` (default, delta sink only) the writer computes
+`numRecords` + `minValues` / `maxValues` / `nullCount` per file and writes them
+into `AddFile.stats`, so Delta prunes files at query time. Stats are collected in
+the same single pass — no extra scan.
+
+Indexed types: integral, float/double (columns with NaN/Inf drop their min/max),
+string, and date (encoded as `yyyy-MM-dd`). Other types (timestamp, decimal,
+boolean, nested) get no min/max — safe by construction: every emitted bound is a
+true lower/upper bound, so skipping can never drop a valid row. `nullCount` is
+tracked for all indexed columns. Set `collectStats=false` to skip the work.
+
+**Effectiveness needs clustering.** `min`/`max` only enable skipping when each file
+covers a narrow, non-overlapping range of the *filtered* column — i.e. the data is
+sorted or `ZORDER`ed on that column. Randomly-ordered data still gets correct stats
+but little skipping (`nullCount`/`numRecords` help regardless). Note
+`sortWithinPartitions` clusters the routing/partition columns, **not** your data
+columns — to skip on `id`, sort by `id` before writing or run
+`OPTIMIZE <table> ZORDER BY (id)` afterward.
+
+**Cost** is `O(rows × indexed columns)`, collected in the same pass. Primitive
+columns are near-free (one comparison/row); string columns cost more (a byte-compare
+per row plus a copy whenever a new min/max appears — worst on ascending-sorted
+strings). On a deliberately cheap local write (2M rows, local SSD) stats added
+~15–18% of write time; on real object-store writes where Parquet encoding + IO
+dominate it is a low-single-digit fraction, which is why it defaults on.
+
+## Selective overwrite (`replaceWhere`)
+
+Replace just the rows matching a **partition** predicate, per table, in one pass —
+the idempotent-reload pattern (re-run for one date, replace only that date, keep the
+rest of history):
+
+```scala
+df.write.format("multiDelta")
+  .option("routeColumn", "forest")
+  .option("basePath", base)
+  .option("partitionBy", "snapshotDate")
+  .option("replaceWhere", "snapshotDate = '2026-07-01'")
+  .mode("overwrite")            // required — replaceWhere only applies to overwrite
+  .save()
+```
+
+Semantics (matching Delta's original partition-scoped `replaceWhere`):
+
+- Per table, removes only the files whose partition matches the predicate, then adds
+  the new files — untouched partitions and tables that received no rows are left alone.
+- **Enforced:** every incoming row must satisfy the predicate. A row outside the region
+  aborts the whole write *before any table commits* (no partial result).
+- The predicate must reference **partition columns only** — data-column predicates throw
+  a clear error on the driver (fail-fast, before executors run). It also requires the
+  delta sink and `mode("overwrite")`.
+
+## Known limitations (extension points)
+
+- **Only `Append` and `Overwrite` save modes.** As a path-based DataSource V2
+  sink it exposes `BATCH_WRITE` (Append) and `SupportsTruncate` (Overwrite). The
+  default `ErrorIfExists` and `Ignore` need a table-existence check a V2 path sink
+  has no concept of, so Spark rejects them at analysis time — **you must set
+  `.mode("append")` or `.mode("overwrite")` explicitly** (a bare `.save()` fails).
+  For `Ignore`/`ErrorIfExists` semantics, check the path yourself before writing or
+  add a catalog (`SupportsCatalogOptions`).
+- **`replaceWhere` is partition-columns only.** Predicates over data columns are
+  rejected up-front (they'd need surviving rows rewritten out of partially-matching
+  files — a data-loss risk if done wrong). Partition predicates are safe: a file is
+  wholly in or out of the region. See the Selective overwrite section.
+- **Sequential commits.** Tables commit one-by-one on the driver; wrap
+  `DeltaCommitter` in a `Future` pool if commit latency matters.
+- **String routing column** assumed; extend `routeValue` for other types.
+- **Partition types limited** to string / boolean / integral. Date & timestamp
+  need value formatting that matches Delta's expectations (extend
+  `rawPartitionValue`).
+- **Overwrite is per-table, not per-partition.** `mode("overwrite")` replaces a
+  touched table entirely; dynamic partition overwrite (replace only the written
+  partitions) would need `RemoveFile`s scoped to the affected partitions.
